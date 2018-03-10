@@ -1,14 +1,130 @@
 #!/usr/bin/env python
 #tpft - tiny proto file transfer
+import os
 from tinyproto import TinyProtoServer, TinyProtoClient, TinyProtoConnection
 import argparse
+import json
+
+CHUNK_SIZE=512*1024
+
+class ProtoPayload(object):
+    __slots__ = ('_proto_status', '_proto_op', '_proto_msg')
+
+    def __init__(self):
+        self._proto_status = None
+        self._proto_op = None
+        self._proto_msg = None
+
+    @property
+    def data_msg(self):
+        return self._data_msg
+    @data_msg.setter
+    def data_msg(self, newvalue):
+        self._data_msg = newvalue
+
+    @property
+    def is_data(self):
+        if self._data_msg is not None:
+            return True
+        return False
+
+    @property
+    def is_proto(self):
+        if self._proto_status is not None or self._proto_op is not None:
+            return True
+        return False
+
+    @property
+    def is_status(self):
+        if self._proto_status is not None:
+            return True
+        return False
+
+    @property
+    def status(self):
+        return self._proto_status
+    @status.setter
+    def status(self, newvalue):
+        if newvalue not in ('ok', 'retry', 'failed', 'shutdown', 'quitserver'):
+            raise ValueError('Incorrect value for status')
+        self._proto_status = newvalue
+        self.op = 'status' # automatically set it as status
+
+    @property
+    def op(self):
+        return self._proto_op
+    @op.setter
+    def op(self, newvalue):
+        if newvalue not in ('download', 'upload', 'status', 'params'):
+            raise ValueError('Incorrect operation')
+        self._proto_op = newvalue
+
+    @property
+    def proto_msg(self):
+        return self._proto_msg
+    @proto_msg.setter
+    def proto_msg(self, newvalue):
+        self._proto_msg = newvalue
+
+    def compile(self):
+        if self.is_proto and self.is_status:
+            return json.dumps({'status': self.status})
+        elif self.is_proto and not self.is_status:
+            return json.dumps({'op': self.op, 'msg': self.proto_msg})
+
+    def decompile(self, msg):
+        payl = json.loads(msg)
+        if 'status' in payl.keys():
+            self.status = payl['status']
+        else:
+            self.op = payl['op']
+            self.proto_msg = payl['msg']
 
 
 #### Server classes ####
 class TPFTServerConnection(TinyProtoConnection):
+    def process_upload(self, p):
+        upload_size = p.proto_msg['source_size']
+        destination_path = p.proto_msg['destination']
+        # let's see if we can write to the file
+        try:
+            destination_f = open(destination_path, 'wb')
+        except IOError as e:
+            payload = ProtoPayload()
+            payload.status = 'failed'
+            self.transmit(payload.compile())
+            self.shutdown = True
+        else:
+            # report back this is ok, and await chunks in loop
+            payload = ProtoPayload()
+            payload.status = 'ok'
+            self.transmit(payload.compile())
+            total_count = 0
+            while total_count < upload_size:
+                upload_buffer = self.receive()
+                destination_f.write(upload_buffer)
+                total_count = total_count + len(upload_buffer)
+
+                self.transmit(payload.compile())
+            self.shutdown = True
+
     def transmission_received(self, msg):
-        print('Received transmission: {0}'.format(msg))
-        self.shutdown = True
+        try:
+            payload = ProtoPayload()
+            payload.decompile(str(msg))
+        except Exception as e:
+            # some weird message, quitting the connection
+            payload = ProtoPayload()
+            payload.status = 'shutdown'
+            self.transmit(payload.compile())
+            self.shutdown = True
+        else:
+            if payload.is_proto and payload.is_status and payload.status == 'shutdown':
+                self.shutdown = True
+            elif payload.is_proto and payload.op == 'upload':
+                self.process_upload(payload)
+            elif payload.is_proto and payload.op == 'download':
+                pass
 
 
 class TPFTServer(TinyProtoServer):
@@ -34,9 +150,65 @@ class TPFTServer(TinyProtoServer):
 
 #### Client ####
 class TPFTClientConnection(TinyProtoConnection):
+    def upload_file(self, p):
+        # first check if you can open the file to upload
+        try:
+            source_f = open(p.proto_msg['source'], 'rb')
+        except IOError as e:
+            self.shutdown = True
+            return False
+
+        # now that we have an opened file, we can test it's size and confirm with server
+        f_stats = os.fstat(source_f.fileno())
+        p.proto_msg['source_size'] = f_stats.st_size
+        p.proto_msg['chunk_size'] = CHUNK_SIZE
+        self.transmit(p.compile())
+
+        # now awaiting confirmation from server
+        response = self.receive()
+        payload = ProtoPayload()
+        payload.decompile(str(response))
+        if payload.status == 'ok':
+            total_count = 0
+            while total_count < f_stats.st_size:
+                upload_buffer = source_f.read(CHUNK_SIZE)
+                self.transmit(upload_buffer)
+                response = self.receive()
+                payload = ProtoPayload()
+                payload.decompile(str(response))
+                if payload.status == 'ok':
+                    total_count = total_count + len(upload_buffer)
+                else:
+                    # something went wrong
+                    self.shutdown = True
+                    return False
+        else:
+            self.shutdown = True
+
+    def process_payload(self, p):
+        if p.is_proto and p.op == 'upload':
+            self.upload_file(p)
+        elif p.is_proto and p.op == 'download':
+            pass
+
     def loop_pass(self):
-        self.transmit('Got connection!!')
-        self.shutdown = True
+        for m in self.msg_from_parent():
+            if m in ('shutdown', 'quitserver'):
+                payload = ProtoPayload()
+                payload.status = m
+                self.transmit(payload.compile())
+                self.shutdown = True
+                break
+            # self.transmit(m)
+            # resp = self.receive()
+            # self.msg_to_parent(resp)
+            payload = ProtoPayload()
+            payload.decompile(str(m))
+            self.process_payload(payload)
+
+    def transmission_received(self, msg):
+        raise IOError('Unhandled transmission in client should not happen')
+
 
 class TPFTClient(TinyProtoClient):
     __slots__ = TinyProtoServer.__slots__ + ('args',)
@@ -46,12 +218,19 @@ class TPFTClient(TinyProtoClient):
 
     def pre_loop(self):
         self.set_conn_handler(TPFTClientConnection)
-        self.connect_to(self.args.host, self.args.port)
+        index = self.connect_to(self.args.host, self.args.port)
         if self.args.verbose:
             print('Starting connection ... ')
 
+        payload = ProtoPayload()
+        if self.args.download:
+            payload.op = 'download'
+        elif self.args.upload:
+            payload.op = 'upload'
+        payload.proto_msg = {'source': self.args.source, 'destination': self.args.destination}
+        self.active_connections[index].msg_to_child(payload.compile())
+
     def loop_pass(self):
-        #if len(self.active_connections) == 0:
         if len([True for x in self.active_connections if x.is_alive()]) == 0:
             self.shutdown = True
 
