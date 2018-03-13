@@ -5,7 +5,7 @@ from tinyproto import TinyProtoServer, TinyProtoClient, TinyProtoConnection
 import argparse
 import json
 
-CHUNK_SIZE=512*1024
+CHUNK_SIZE=4*1024*1024
 
 class ProtoPayload(object):
     __slots__ = ('_proto_status', '_proto_op', '_proto_msg')
@@ -108,6 +108,46 @@ class TPFTServerConnection(TinyProtoConnection):
                 self.transmit(payload.compile())
             self.shutdown = True
 
+    def process_download(self, p):
+        # first lets see if it can open the source file for client download
+        try:
+            source_f = open(p.proto_msg['source'], 'rb')
+        except IOError as e:
+            # notify client it's not goint to happen
+            payload = ProtoPayload()
+            payload.status='failed'
+            payload.proto_msg = 'Failed to open source file'
+            self.transmit(payload.compile())
+            self.shutdown = True
+        else:
+            # now let's see what this file is, and reply details to client
+            f_stats = os.fstat(source_f.fileno())
+            p.proto_msg['source_size'] = f_stats.st_size
+            p.proto_msg['chunk_size'] = CHUNK_SIZE
+            self.transmit(p.compile())
+
+            # now let's check if client is ok with it
+            response = self.receive()
+            payload = ProtoPayload()
+            payload.decompile(str(response))
+            if payload.is_status and payload.status == 'failed':
+                # probably client could not open a destination file for writing the download
+                self.shutdown = True
+            elif payload.is_status and payload.status == 'ok':
+                total_count = 0
+                while total_count < f_stats.st_size:
+                    download_buffer = source_f.read(CHUNK_SIZE)
+                    self.transmit(download_buffer)
+                    response = self.receive()
+                    payload = ProtoPayload()
+                    payload.decompile(str(response))
+                    if payload.status == 'ok':
+                        total_count = total_count + len(download_buffer)
+                    else:
+                        # something went wrong
+                        self.shutdown = True
+                        return False
+
     def transmission_received(self, msg):
         try:
             payload = ProtoPayload()
@@ -124,7 +164,7 @@ class TPFTServerConnection(TinyProtoConnection):
             elif payload.is_proto and payload.op == 'upload':
                 self.process_upload(payload)
             elif payload.is_proto and payload.op == 'download':
-                pass
+                self.process_download(payload)
 
 
 class TPFTServer(TinyProtoServer):
@@ -185,11 +225,46 @@ class TPFTClientConnection(TinyProtoConnection):
         else:
             self.shutdown = True
 
+    def download_file(self, p):
+        # first let's just pass on the info of wanting to download file and see what server responds
+        self.transmit(p.compile())
+        response = self.receive()
+        payload = ProtoPayload()
+        payload.decompile(str(response))
+        if payload.is_status and (payload.status == 'failed' or payload.status == 'shutdown'):
+            # probably server could not open the source file
+            self.shutdown = True
+            return False
+        elif payload.op == 'download' and payload.proto_msg.has_key('source_size') and payload.proto_msg.has_key('chunk_size'):
+            # this means server opened a file, nows it's size and will upload it in chunks
+            # now we have to see if we can open a destination file and write to it
+            download_size = payload.proto_msg['source_size']
+            download_path = payload.proto_msg['destination']
+            try:
+                destination_f = open(download_path, 'wb')
+            except IOError as e:
+                payload = ProtoPayload()
+                payload.status='failed'
+                self.transmit(payload.compile())
+                self.shutdown = True
+            else:
+                # report back all is ok and await chunks in loop
+                payload = ProtoPayload()
+                payload.status = 'ok'
+                self.transmit(payload.compile())
+                total_count = 0
+                while total_count < download_size:
+                    download_buffer = self.receive()
+                    destination_f.write(download_buffer)
+                    total_count = total_count + len(download_buffer)
+                    self.transmit(payload.compile())
+                self.shutdown = True
+
     def process_payload(self, p):
         if p.is_proto and p.op == 'upload':
             self.upload_file(p)
         elif p.is_proto and p.op == 'download':
-            pass
+            self.download_file(p)
 
     def loop_pass(self):
         for m in self.msg_from_parent():
