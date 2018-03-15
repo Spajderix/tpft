@@ -4,8 +4,9 @@ import os
 from tinyproto import TinyProtoServer, TinyProtoClient, TinyProtoConnection
 import argparse
 import json
+import time
 
-CHUNK_SIZE=4*1024*1024
+CHUNK_SIZE=512*1024
 
 class ProtoPayload(object):
     __slots__ = ('_proto_status', '_proto_op', '_proto_msg')
@@ -86,6 +87,7 @@ class TPFTServerConnection(TinyProtoConnection):
     def process_upload(self, p):
         upload_size = p.proto_msg['source_size']
         destination_path = p.proto_msg['destination']
+        self.msg_to_parent('Client requested an upload of file {0} of size {1} bytes to server destination {2}'.format(p.proto_msg['source'], upload_size, destination_path))
         # let's see if we can write to the file
         try:
             destination_f = open(destination_path, 'wb')
@@ -126,6 +128,8 @@ class TPFTServerConnection(TinyProtoConnection):
             p.proto_msg['chunk_size'] = CHUNK_SIZE
             self.transmit(p.compile())
 
+            self.msg_to_parent('Client requested download of file {0} of size {1}'.format(p.proto_msg['source'], f_stats.st_size))
+
             # now let's check if client is ok with it
             response = self.receive()
             payload = ProtoPayload()
@@ -161,6 +165,7 @@ class TPFTServerConnection(TinyProtoConnection):
         else:
             if payload.is_proto and payload.is_status and payload.status == 'shutdown':
                 self.shutdown = True
+                self.msg_to_parent('Client requested a shutdown right away.')
             elif payload.is_proto and payload.op == 'upload':
                 self.process_upload(payload)
             elif payload.is_proto and payload.op == 'download':
@@ -180,6 +185,12 @@ class TPFTServer(TinyProtoServer):
     def conn_shutdown(self, conn_h):
         if self.args.verbose:
             print('Connection closed from: {0}'.format((conn_h.host, conn_h.port)))
+
+    def loop_pass(self):
+        for conn_h in self.active_connections:
+            for msg in conn_h.msg_from_child():
+                if self.args.verbose:
+                    print '{0}: {1}'.format((conn_h.host, conn_h.port), msg)
 
     def start_listening(self):
         self.add_addr(self.args.host, self.args.port)
@@ -218,6 +229,8 @@ class TPFTClientConnection(TinyProtoConnection):
                 payload.decompile(str(response))
                 if payload.status == 'ok':
                     total_count = total_count + len(upload_buffer)
+                    # notify client on the progress
+                    self.msg_to_parent((f_stats.st_size, total_count)) # size of file, overal transferred size
                 else:
                     # something went wrong
                     self.shutdown = True
@@ -257,6 +270,8 @@ class TPFTClientConnection(TinyProtoConnection):
                     download_buffer = self.receive()
                     destination_f.write(download_buffer)
                     total_count = total_count + len(download_buffer)
+                    # notify client on the progress
+                    self.msg_to_parent((download_size, total_count))
                     self.transmit(payload.compile())
                 self.shutdown = True
 
@@ -286,14 +301,26 @@ class TPFTClientConnection(TinyProtoConnection):
 
 
 class TPFTClient(TinyProtoClient):
-    __slots__ = TinyProtoServer.__slots__ + ('args',)
+    __slots__ = TinyProtoServer.__slots__ + ('args', 'active_index', 'progress', 'progress_ts')
 
     def set_args(self, a):
         self.args = a
 
+    def process_messages(self):
+        for msg in self.active_connections[self.active_index].msg_from_child():
+            self.progress = float(msg[1]) / float(msg[0]) * 100
+
+    def display_progress(self):
+        if self.args.progress:
+            if time.time() - self.progress_ts > 1.0:
+                print 'Progress: {0:.2f}%'.format(self.progress)
+                self.progress_ts = time.time()
+
     def pre_loop(self):
+        self.progress = 0
+        self.progress_ts = time.time()
         self.set_conn_handler(TPFTClientConnection)
-        index = self.connect_to(self.args.host, self.args.port)
+        self.active_index = self.connect_to(self.args.host, self.args.port)
         if self.args.verbose:
             print('Starting connection ... ')
 
@@ -303,11 +330,13 @@ class TPFTClient(TinyProtoClient):
         elif self.args.upload:
             payload.op = 'upload'
         payload.proto_msg = {'source': self.args.source, 'destination': self.args.destination}
-        self.active_connections[index].msg_to_child(payload.compile())
+        self.active_connections[self.active_index].msg_to_child(payload.compile())
 
     def loop_pass(self):
         if len([True for x in self.active_connections if x.is_alive()]) == 0:
             self.shutdown = True
+        self.process_messages()
+        self.display_progress()
 
     def post_loop(self):
         if self.args.verbose:
