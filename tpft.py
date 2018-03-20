@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #tpft - tiny proto file transfer
 import os
 from tinyproto import TinyProtoServer, TinyProtoClient, TinyProtoConnection
@@ -94,20 +94,20 @@ class TPFTServerConnection(TinyProtoConnection):
         except IOError as e:
             payload = ProtoPayload()
             payload.status = 'failed'
-            self.transmit(payload.compile())
+            self.transmit(payload.compile().encode())
             self.shutdown = True
         else:
             # report back this is ok, and await chunks in loop
             payload = ProtoPayload()
             payload.status = 'ok'
-            self.transmit(payload.compile())
+            self.transmit(payload.compile().encode())
             total_count = 0
             while total_count < upload_size:
                 upload_buffer = self.receive()
                 destination_f.write(upload_buffer)
                 total_count = total_count + len(upload_buffer)
 
-                self.transmit(payload.compile())
+                self.transmit(payload.compile().encode())
             self.shutdown = True
 
     def process_download(self, p):
@@ -119,21 +119,21 @@ class TPFTServerConnection(TinyProtoConnection):
             payload = ProtoPayload()
             payload.status='failed'
             payload.proto_msg = 'Failed to open source file'
-            self.transmit(payload.compile())
+            self.transmit(payload.compile().encode())
             self.shutdown = True
         else:
             # now let's see what this file is, and reply details to client
             f_stats = os.fstat(source_f.fileno())
             p.proto_msg['source_size'] = f_stats.st_size
             p.proto_msg['chunk_size'] = CHUNK_SIZE
-            self.transmit(p.compile())
+            self.transmit(p.compile().encode())
 
             self.msg_to_parent('Client requested download of file {0} of size {1}'.format(p.proto_msg['source'], f_stats.st_size))
 
             # now let's check if client is ok with it
             response = self.receive()
             payload = ProtoPayload()
-            payload.decompile(str(response))
+            payload.decompile(response.decode())
             if payload.is_status and payload.status == 'failed':
                 # probably client could not open a destination file for writing the download
                 self.shutdown = True
@@ -144,7 +144,7 @@ class TPFTServerConnection(TinyProtoConnection):
                     self.transmit(download_buffer)
                     response = self.receive()
                     payload = ProtoPayload()
-                    payload.decompile(str(response))
+                    payload.decompile(response.decode())
                     if payload.status == 'ok':
                         total_count = total_count + len(download_buffer)
                     else:
@@ -155,12 +155,12 @@ class TPFTServerConnection(TinyProtoConnection):
     def transmission_received(self, msg):
         try:
             payload = ProtoPayload()
-            payload.decompile(str(msg))
+            payload.decompile(msg.decode())
         except Exception as e:
             # some weird message, quitting the connection
             payload = ProtoPayload()
             payload.status = 'shutdown'
-            self.transmit(payload.compile())
+            self.transmit(payload.compile().encode())
             self.shutdown = True
         else:
             if payload.is_proto and payload.is_status and payload.status == 'shutdown':
@@ -190,7 +190,7 @@ class TPFTServer(TinyProtoServer):
         for conn_h in self.active_connections:
             for msg in conn_h.msg_from_child():
                 if self.args.verbose:
-                    print '{0}: {1}'.format((conn_h.host, conn_h.port), msg)
+                    print('{0}: {1}'.format((conn_h.host, conn_h.port), msg))
 
     def start_listening(self):
         self.add_addr(self.args.host, self.args.port)
@@ -213,12 +213,12 @@ class TPFTClientConnection(TinyProtoConnection):
         f_stats = os.fstat(source_f.fileno())
         p.proto_msg['source_size'] = f_stats.st_size
         p.proto_msg['chunk_size'] = CHUNK_SIZE
-        self.transmit(p.compile())
+        self.transmit(p.compile().encode())
 
         # now awaiting confirmation from server
         response = self.receive()
         payload = ProtoPayload()
-        payload.decompile(str(response))
+        payload.decompile(response.decode())
         if payload.status == 'ok':
             total_count = 0
             while total_count < f_stats.st_size:
@@ -226,7 +226,7 @@ class TPFTClientConnection(TinyProtoConnection):
                 self.transmit(upload_buffer)
                 response = self.receive()
                 payload = ProtoPayload()
-                payload.decompile(str(response))
+                payload.decompile(response.decode())
                 if payload.status == 'ok':
                     total_count = total_count + len(upload_buffer)
                     # notify client on the progress
@@ -240,15 +240,15 @@ class TPFTClientConnection(TinyProtoConnection):
 
     def download_file(self, p):
         # first let's just pass on the info of wanting to download file and see what server responds
-        self.transmit(p.compile())
+        self.transmit(p.compile().encode())
         response = self.receive()
         payload = ProtoPayload()
-        payload.decompile(str(response))
+        payload.decompile(response.decode())
         if payload.is_status and (payload.status == 'failed' or payload.status == 'shutdown'):
             # probably server could not open the source file
             self.shutdown = True
             return False
-        elif payload.op == 'download' and payload.proto_msg.has_key('source_size') and payload.proto_msg.has_key('chunk_size'):
+        elif payload.op == 'download' and 'source_size' in payload.proto_msg.keys() and 'chunk_size' in payload.proto_msg.keys():
             # this means server opened a file, nows it's size and will upload it in chunks
             # now we have to see if we can open a destination file and write to it
             download_size = payload.proto_msg['source_size']
@@ -258,13 +258,13 @@ class TPFTClientConnection(TinyProtoConnection):
             except IOError as e:
                 payload = ProtoPayload()
                 payload.status='failed'
-                self.transmit(payload.compile())
+                self.transmit(payload.compile().encode())
                 self.shutdown = True
             else:
                 # report back all is ok and await chunks in loop
                 payload = ProtoPayload()
                 payload.status = 'ok'
-                self.transmit(payload.compile())
+                self.transmit(payload.compile().encode())
                 total_count = 0
                 while total_count < download_size:
                     download_buffer = self.receive()
@@ -272,7 +272,7 @@ class TPFTClientConnection(TinyProtoConnection):
                     total_count = total_count + len(download_buffer)
                     # notify client on the progress
                     self.msg_to_parent((download_size, total_count))
-                    self.transmit(payload.compile())
+                    self.transmit(payload.compile().encode())
                 self.shutdown = True
 
     def process_payload(self, p):
@@ -286,14 +286,14 @@ class TPFTClientConnection(TinyProtoConnection):
             if m in ('shutdown', 'quitserver'):
                 payload = ProtoPayload()
                 payload.status = m
-                self.transmit(payload.compile())
+                self.transmit(payload.compile().encode())
                 self.shutdown = True
                 break
             # self.transmit(m)
             # resp = self.receive()
             # self.msg_to_parent(resp)
             payload = ProtoPayload()
-            payload.decompile(str(m))
+            payload.decompile(m.decode())
             self.process_payload(payload)
 
     def transmission_received(self, msg):
@@ -313,7 +313,7 @@ class TPFTClient(TinyProtoClient):
     def display_progress(self):
         if self.args.progress:
             if time.time() - self.progress_ts > 1.0:
-                print 'Progress: {0:.2f}%'.format(self.progress)
+                print('Progress: {0:.2f}%'.format(self.progress))
                 self.progress_ts = time.time()
 
     def pre_loop(self):
@@ -330,7 +330,7 @@ class TPFTClient(TinyProtoClient):
         elif self.args.upload:
             payload.op = 'upload'
         payload.proto_msg = {'source': self.args.source, 'destination': self.args.destination}
-        self.active_connections[self.active_index].msg_to_child(payload.compile())
+        self.active_connections[self.active_index].msg_to_child(payload.compile().encode())
 
     def loop_pass(self):
         if len([True for x in self.active_connections if x.is_alive()]) == 0:
