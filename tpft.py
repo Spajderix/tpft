@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 #tpft - tiny proto file transfer
 import os
-from tinyproto import TinyProtoServer, TinyProtoClient, TinyProtoConnection
+from tinyproto import TinyProtoServer, TinyProtoClient, TinyProtoConnection, TinyProtoConnectionDetails
 import argparse
 import json
 import time
@@ -164,8 +164,8 @@ class DownloadRequestLetter(Letter):
 class TpftServerConnection(TinyProtoConnection):
     __slots__ = ('verbose', 'display_progress', 'uuid')
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.verbose = False
         self.display_progress = False
         self.uuid = None
@@ -261,17 +261,7 @@ class TpftServerConnection(TinyProtoConnection):
         self.handle_message(envelope)
 
 class TpftServer(TinyProtoServer):
-    __slots__ = ('host', 'port', 'verbose', 'display_progress')
-
-    def __init__(self, host, port, verbose=False, progress=False):
-        super().__init__()
-        self.host = host
-        self.port = port
-        self.verbose = verbose
-        self.display_progress = progress
-
-        self.set_conn_handler(TpftServerConnection)
-        self.add_addr(self.host, self.port)
+    __slots__ = ('verbose', 'display_progress')
 
     def conn_init(self, conn_id, conn_o):
         if self.verbose:
@@ -289,8 +279,8 @@ class TpftServer(TinyProtoServer):
 class TpftClientUploadConnection(TinyProtoConnection):
     __slots__ = ('source_file_descriptor', 'source_file_size', 'destination_path', 'ready_for_upload', 'progress')
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.ready_for_upload = False
 
     def upload_file(self, source_file, source_file_size, destination_path):
@@ -346,8 +336,8 @@ class TpftClientUploadConnection(TinyProtoConnection):
 class TpftClientDownloadConnection(TinyProtoConnection):
     __slots__ = ('local_path', 'remote_path', 'ready_for_download', 'progress')
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.ready_for_download = False
 
     def download_file(self, remote_path, local_path):
@@ -406,7 +396,8 @@ class TpftClient(TinyProtoClient):
         if not isinstance(local_path, ParsedPath) or not isinstance(remote_path, ParsedPath):
             raise ValueError('Paths need to be instances of ParsedPath')
 
-        uuid = self.connect_to(remote_path.host, remote_path.port if remote_path.port is not None else DEFAULT_PORT)
+        connection_details = TinyProtoConnectionDetails(remote_path.host, remote_path.port if remote_path.port is not None else DEFAULT_PORT)
+        uuid = self.connect_to(connection_details)
         connection = self.active_connections[uuid]
         connection.upload_file(local_path.filedescriptor, local_path.filesize, remote_path.path)
 
@@ -421,7 +412,8 @@ class TpftClient(TinyProtoClient):
         if not isinstance(local_path, ParsedPath) or not isinstance(remote_path, ParsedPath):
             raise ValueError('Paths need to be instances of ParsedPath')
 
-        uuid = self.connect_to(remote_path.host, remote_path.port if remote_path.port is not None else DEFAULT_PORT)
+        connection_details = TinyProtoConnectionDetails(remote_path.host, remote_path.port if remote_path.port is not None else DEFAULT_PORT)
+        uuid = self.connect_to(connection_details)
         connection = self.active_connections[uuid]
         connection.download_file(remote_path.path, local_path.path)
 
@@ -513,7 +505,10 @@ def handle_server(args):
     if args.verbose:
         print('Picked server initiation on host {} port {}'.format(listen_host, listen_port))
 
-    srv = TpftServer(listen_host, listen_port, args.verbose, args.progress)
+    srv_connection_details = TinyProtoConnectionDetails(listen_host, listen_port)
+    srv = TpftServer(listen_addresses = [srv_connection_details], connection_handler = TpftServerConnection)
+    srv.verbose = args.verbose
+    srv.display_progress = args.progress
     srv.start()
 
 def handle_client(args):
